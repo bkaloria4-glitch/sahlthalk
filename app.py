@@ -1,11 +1,14 @@
 from flask import Flask, request, redirect, session, url_for, render_template_string
 from werkzeug.security import generate_password_hash, check_password_hash
-import sqlite3, os
+import os
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.errors import UniqueViolation
 from functools import wraps
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "replace-this-before-online-use")
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sahlthalk.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DEFAULT_CASH_NUMBER = "01279790505"
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "ChangeMe123!")
@@ -39,40 +42,42 @@ table{width:100%;border-collapse:collapse;background:#fff;margin:15px 0}th,td{te
 footer{text-align:center;padding:24px;color:#667085}
 """
 def connect():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing. Add your Neon connection string in Render Environment Variables.")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 def init_db():
+    schema = [
+        "CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'student')",
+        "CREATE TABLE IF NOT EXISTS courses(id BIGSERIAL PRIMARY KEY,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',price DOUBLE PRECISION NOT NULL DEFAULT 0,visible INTEGER NOT NULL DEFAULT 1)",
+        "CREATE TABLE IF NOT EXISTS payments(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,course_id BIGINT NOT NULL,sender_wallet TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS enrollments(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,course_id BIGINT NOT NULL,UNIQUE(user_id,course_id))",
+        "CREATE TABLE IF NOT EXISTS results(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,subject TEXT NOT NULL,score INTEGER NOT NULL,total INTEGER NOT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS questions(id BIGSERIAL PRIMARY KEY,subject TEXT NOT NULL,question TEXT NOT NULL,opt1 TEXT NOT NULL,opt2 TEXT NOT NULL,opt3 TEXT NOT NULL,opt4 TEXT NOT NULL DEFAULT '',answer INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1)",
+        "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    ]
     with connect() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'student');
-        CREATE TABLE IF NOT EXISTS courses(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',price REAL NOT NULL DEFAULT 0,visible INTEGER NOT NULL DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,course_id INTEGER NOT NULL,sender_wallet TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS enrollments(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,course_id INTEGER NOT NULL,UNIQUE(user_id,course_id));
-        CREATE TABLE IF NOT EXISTS results(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,subject TEXT NOT NULL,score INTEGER NOT NULL,total INTEGER NOT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY AUTOINCREMENT,subject TEXT NOT NULL,question TEXT NOT NULL,opt1 TEXT NOT NULL,opt2 TEXT NOT NULL,opt3 TEXT NOT NULL,opt4 TEXT NOT NULL DEFAULT '',answer INTEGER NOT NULL,active INTEGER NOT NULL DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        """)
-        con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", ("cash_number", DEFAULT_CASH_NUMBER))
-        if con.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 0:
+        for statement in schema:
+            con.execute(statement)
+        con.execute("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT (key) DO NOTHING", ("cash_number", DEFAULT_CASH_NUMBER))
+        if con.execute("SELECT COUNT(*) AS count FROM questions").fetchone()["count"] == 0:
             for subject_key, quiz_items in QUIZZES.items():
                 for question, options, answer in quiz_items:
                     padded = (options + ["", ""])[:4]
-                    con.execute("INSERT INTO questions(subject,question,opt1,opt2,opt3,opt4,answer) VALUES(?,?,?,?,?,?,?)",
+                    con.execute("INSERT INTO questions(subject,question,opt1,opt2,opt3,opt4,answer) VALUES(%s,%s,%s,%s,%s,%s,%s)",
                                 (subject_key, question, padded[0], padded[1], padded[2], padded[3], answer))
-        if con.execute("SELECT COUNT(*) FROM courses").fetchone()[0] == 0:
-            con.executemany("INSERT INTO courses(title,description,price) VALUES(?,?,?)", [
+        if con.execute("SELECT COUNT(*) AS count FROM courses").fetchone()["count"] == 0:
+            con.executemany("INSERT INTO courses(title,description,price) VALUES(%s,%s,%s)", [
                 ("مراجعة اللغة العربية", "شرح ومراجعة وتدريبات اللغة العربية", 150),
                 ("مراجعة التاريخ", "شرح ومراجعة أهم دروس التاريخ", 120),
                 ("مراجعة اللغة الإنجليزية", "شرح ومراجعة وتدريبات اللغة الإنجليزية", 150)])
-        if not con.execute("SELECT id FROM users WHERE username=?", (ADMIN_USER,)).fetchone():
-            con.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
+        if not con.execute("SELECT id FROM users WHERE username=%s", (ADMIN_USER,)).fetchone():
+            con.execute("INSERT INTO users(username,password_hash,role) VALUES(%s,%s,%s)",
                         (ADMIN_USER, generate_password_hash(ADMIN_PASSWORD), "admin"))
 
 def get_setting(key, default=""):
     with connect() as con:
-        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        row = con.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
     return row["value"] if row else default
 
 def page(title, body, **ctx):
@@ -118,9 +123,9 @@ def register():
         else:
             try:
                 with connect() as con:
-                    con.execute("INSERT INTO users(username,password_hash) VALUES(?,?)", (username, generate_password_hash(password)))
+                    con.execute("INSERT INTO users(username,password_hash) VALUES(%s,%s)", (username, generate_password_hash(password)))
                 return redirect(url_for("login"))
-            except sqlite3.IntegrityError: error = "اسم المستخدم مستخدم بالفعل."
+            except UniqueViolation: error = "اسم المستخدم مستخدم بالفعل."
     body = """{% if error %}<div class="error">{{ error }}</div>{% endif %}<div class="box"><form method="post">
     <label>اسم المستخدم</label><input name="username" required minlength="3" autocomplete="username">
     <label>كلمة المرور</label><input type="password" name="password" required minlength="6" autocomplete="new-password">
@@ -132,7 +137,7 @@ def login():
     error = ""
     if request.method == "POST":
         username, password = request.form.get("username", "").strip(), request.form.get("password", "")
-        with connect() as con: user = con.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        with connect() as con: user = con.execute("SELECT * FROM users WHERE username=%s", (username,)).fetchone()
         if user and check_password_hash(user["password_hash"], password):
             session.clear(); session["user_id"] = user["id"]; session["username"] = user["username"]; session["role"] = user["role"]
             return redirect(url_for("admin" if user["role"] == "admin" else "account"))
@@ -159,8 +164,8 @@ def courses():
 @app.route("/course/<int:course_id>")
 def course_detail(course_id):
     with connect() as con:
-        c = con.execute("SELECT * FROM courses WHERE id=? AND visible=1", (course_id,)).fetchone()
-        enrolled = bool(session.get("user_id") and con.execute("SELECT 1 FROM enrollments WHERE user_id=? AND course_id=?", (session["user_id"], course_id)).fetchone())
+        c = con.execute("SELECT * FROM courses WHERE id=%s AND visible=1", (course_id,)).fetchone()
+        enrolled = bool(session.get("user_id") and con.execute("SELECT 1 FROM enrollments WHERE user_id=%s AND course_id=%s", (session["user_id"], course_id)).fetchone())
     if not c: return "الكورس غير موجود.", 404
     body = """<div class="box"><h3>{{ c['title'] }}</h3><p>{{ c['description'] }}</p><p class="price">السعر: {{ "%.2f"|format(c['price']) }} جنيه مصري</p>
     {% if enrolled %}<div class="notice">أنت مشترك بالفعل في هذا الكورس.</div>{% elif session.get('user_id') %}
@@ -171,9 +176,9 @@ def course_detail(course_id):
 @login_required
 def pay(course_id):
     with connect() as con:
-        c = con.execute("SELECT * FROM courses WHERE id=? AND visible=1", (course_id,)).fetchone()
-        enrolled = con.execute("SELECT 1 FROM enrollments WHERE user_id=? AND course_id=?", (session["user_id"], course_id)).fetchone()
-        pending = con.execute("SELECT 1 FROM payments WHERE user_id=? AND course_id=? AND status='pending'", (session["user_id"], course_id)).fetchone()
+        c = con.execute("SELECT * FROM courses WHERE id=%s AND visible=1", (course_id,)).fetchone()
+        enrolled = con.execute("SELECT 1 FROM enrollments WHERE user_id=%s AND course_id=%s", (session["user_id"], course_id)).fetchone()
+        pending = con.execute("SELECT 1 FROM payments WHERE user_id=%s AND course_id=%s AND status='pending'", (session["user_id"], course_id)).fetchone()
     if not c: return "الكورس غير موجود.", 404
     if enrolled: return redirect(url_for("account"))
     error = ""
@@ -182,7 +187,7 @@ def pay(course_id):
         if len(sender_wallet) < 5 or not reference: error = "اكتب رقم المحفظة المحوّل منها ورقم العملية."
         else:
             with connect() as con:
-                con.execute("INSERT INTO payments(user_id,course_id,sender_wallet,reference) VALUES(?,?,?,?)",
+                con.execute("INSERT INTO payments(user_id,course_id,sender_wallet,reference) VALUES(%s,%s,%s,%s)",
                             (session["user_id"], course_id, sender_wallet, reference))
             return redirect(url_for("account"))
     body = """<div class="box"><h3>{{ c['title'] }}</h3><p class="price">المبلغ المطلوب: {{ "%.2f"|format(c['price']) }} جنيه</p>
@@ -200,10 +205,10 @@ def pay(course_id):
 @login_required
 def account():
     with connect() as con:
-        user = con.execute("SELECT username FROM users WHERE id=?", (session["user_id"],)).fetchone()
-        enrolled = con.execute("SELECT courses.title,courses.description FROM enrollments JOIN courses ON courses.id=enrollments.course_id WHERE enrollments.user_id=? ORDER BY courses.title", (session["user_id"],)).fetchall()
-        payments = con.execute("SELECT payments.*,courses.title FROM payments JOIN courses ON courses.id=payments.course_id WHERE payments.user_id=? ORDER BY payments.id DESC", (session["user_id"],)).fetchall()
-        results = con.execute("SELECT * FROM results WHERE user_id=? ORDER BY id DESC", (session["user_id"],)).fetchall()
+        user = con.execute("SELECT username FROM users WHERE id=%s", (session["user_id"],)).fetchone()
+        enrolled = con.execute("SELECT courses.title,courses.description FROM enrollments JOIN courses ON courses.id=enrollments.course_id WHERE enrollments.user_id=%s ORDER BY courses.title", (session["user_id"],)).fetchall()
+        payments = con.execute("SELECT payments.*,courses.title FROM payments JOIN courses ON courses.id=payments.course_id WHERE payments.user_id=%s ORDER BY payments.id DESC", (session["user_id"],)).fetchall()
+        results = con.execute("SELECT * FROM results WHERE user_id=%s ORDER BY id DESC", (session["user_id"],)).fetchall()
     body = """<div class="box"><h3>أهلًا {{ user['username'] }}</h3><h3>كورساتي</h3>
     {% for c in enrolled %}<p>✅ {{ c['title'] }} — {{ c['description'] }}</p>{% else %}<p>لم يتم تفعيل أي كورس بعد.</p>{% endfor %}
     <h3>طلبات الدفع</h3><table><tr><th>الكورس</th><th>رقم العملية</th><th>الحالة</th></tr>
@@ -219,7 +224,7 @@ def quiz(subject):
     if subject not in subject_names:
         return "المادة غير موجودة.", 404
     with connect() as con:
-        rows = con.execute("SELECT * FROM questions WHERE subject=? AND active=1 ORDER BY id", (subject,)).fetchall()
+        rows = con.execute("SELECT * FROM questions WHERE subject=%s AND active=1 ORDER BY id", (subject,)).fetchall()
     if not rows:
         return page("اختبار " + subject_names[subject],
                     '<div class="box"><p>لا توجد أسئلة مضافة لهذه المادة حتى الآن.</p><a class="btn" href="/">الرئيسية</a></div>')
@@ -232,7 +237,7 @@ def quiz(subject):
     if request.method == "POST":
         score = sum(1 for i, q in enumerate(questions) if request.form.get("q" + str(i)) == str(q["answer"]))
         with connect() as con:
-            con.execute("INSERT INTO results(user_id,subject,score,total) VALUES(?,?,?,?)",
+            con.execute("INSERT INTO results(user_id,subject,score,total) VALUES(%s,%s,%s,%s)",
                         (session["user_id"], subject_names[subject], score, len(questions)))
         percent = round(score * 100 / len(questions))
         return page("نتيجة الاختبار", """
@@ -269,19 +274,19 @@ def admin():
                 except ValueError: answer = -1
                 valid_subjects = {item[0] for item in SUBJECTS}
                 if subject in valid_subjects and question and all(options[i] for i in range(3)) and 0 <= answer < (4 if options[3] else 3):
-                    con.execute("INSERT INTO questions(subject,question,opt1,opt2,opt3,opt4,answer) VALUES(?,?,?,?,?,?,?)",
+                    con.execute("INSERT INTO questions(subject,question,opt1,opt2,opt3,opt4,answer) VALUES(%s,%s,%s,%s,%s,%s,%s)",
                                 (subject, question, options[0], options[1], options[2], options[3], answer))
                     message = "تمت إضافة السؤال بنجاح."
                 else: message = "راجع المادة والسؤال والاختيارات والإجابة الصحيحة."
             elif action == "delete_question":
                 qid = request.form.get("question_id", type=int)
-                if qid: con.execute("DELETE FROM questions WHERE id=?", (qid,)); message = "تم حذف السؤال."
+                if qid: con.execute("DELETE FROM questions WHERE id=%s", (qid,)); message = "تم حذف السؤال."
             elif action == "add_course":
                 title, description = request.form.get("title", "").strip(), request.form.get("description", "").strip()
                 try: price = float(request.form.get("price", ""))
                 except ValueError: price = -1
                 if title and price >= 0:
-                    con.execute("INSERT INTO courses(title,description,price) VALUES(?,?,?)", (title, description, price)); message = "تمت إضافة الكورس."
+                    con.execute("INSERT INTO courses(title,description,price) VALUES(%s,%s,%s)", (title, description, price)); message = "تمت إضافة الكورس."
                 else: message = "تحقق من اسم الكورس والسعر."
             elif action == "edit_course":
                 cid = request.form.get("course_id", type=int)
@@ -289,43 +294,43 @@ def admin():
                 try: price = float(request.form.get("price", ""))
                 except ValueError: price = -1
                 if cid and title and price >= 0:
-                    con.execute("UPDATE courses SET title=?,description=?,price=? WHERE id=?", (title, description, price, cid)); message = "تم تعديل بيانات الكورس."
+                    con.execute("UPDATE courses SET title=%s,description=%s,price=%s WHERE id=%s", (title, description, price, cid)); message = "تم تعديل بيانات الكورس."
                 else: message = "تحقق من بيانات الكورس والسعر."
             elif action == "toggle_course":
                 cid = request.form.get("course_id", type=int)
-                if cid: con.execute("UPDATE courses SET visible=1-visible WHERE id=?", (cid,)); message = "تم تغيير ظهور الكورس."
+                if cid: con.execute("UPDATE courses SET visible=1-visible WHERE id=%s", (cid,)); message = "تم تغيير ظهور الكورس."
             elif action == "delete_course":
                 cid = request.form.get("course_id", type=int)
                 if cid:
-                    used = con.execute("SELECT (SELECT COUNT(*) FROM payments WHERE course_id=?)+(SELECT COUNT(*) FROM enrollments WHERE course_id=?)", (cid,cid)).fetchone()[0]
+                    used = con.execute("SELECT (SELECT COUNT(*) FROM payments WHERE course_id=%s)+(SELECT COUNT(*) FROM enrollments WHERE course_id=%s) AS count", (cid,cid)).fetchone()["count"]
                     if used: message = "لا يمكن حذف كورس له طلبات دفع أو اشتراكات؛ يمكنك إخفاؤه بدلًا من ذلك."
-                    else: con.execute("DELETE FROM courses WHERE id=?", (cid,)); message = "تم حذف الكورس."
+                    else: con.execute("DELETE FROM courses WHERE id=%s", (cid,)); message = "تم حذف الكورس."
             elif action in ("approve", "reject"):
                 pid = request.form.get("payment_id", type=int)
-                payment = con.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone() if pid else None
+                payment = con.execute("SELECT * FROM payments WHERE id=%s", (pid,)).fetchone() if pid else None
                 if payment and payment["status"] == "pending":
                     status = "approved" if action == "approve" else "rejected"
-                    con.execute("UPDATE payments SET status=? WHERE id=?", (status, pid))
-                    if action == "approve": con.execute("INSERT OR IGNORE INTO enrollments(user_id,course_id) VALUES(?,?)", (payment["user_id"], payment["course_id"]))
+                    con.execute("UPDATE payments SET status=%s WHERE id=%s", (status, pid))
+                    if action == "approve": con.execute("INSERT INTO enrollments(user_id,course_id) VALUES(%s,%s) ON CONFLICT (user_id,course_id) DO NOTHING", (payment["user_id"], payment["course_id"]))
                     message = "تم تحديث حالة الطلب."
             elif action == "save_settings":
                 cash = request.form.get("cash_number", "").strip()
                 if len(cash) >= 8:
-                    con.execute("INSERT INTO settings(key,value) VALUES('cash_number',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (cash,))
+                    con.execute("INSERT INTO settings(key,value) VALUES('cash_number',%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (cash,))
                     message = "تم حفظ رقم فودافون كاش."
                 else: message = "اكتب رقم محفظة صحيحًا."
             elif action == "change_admin_password":
                 current = request.form.get("current_password", "")
                 new_password = request.form.get("new_password", "")
-                admin_user = con.execute("SELECT * FROM users WHERE id=? AND role='admin'", (session["user_id"],)).fetchone()
+                admin_user = con.execute("SELECT * FROM users WHERE id=%s AND role='admin'", (session["user_id"],)).fetchone()
                 if admin_user and check_password_hash(admin_user["password_hash"], current) and len(new_password) >= 10:
-                    con.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(new_password), session["user_id"]))
+                    con.execute("UPDATE users SET password_hash=%s WHERE id=%s", (generate_password_hash(new_password), session["user_id"]))
                     message = "تم تغيير كلمة مرور الأدمن."
                 else: message = "كلمة المرور الحالية غير صحيحة أو الجديدة أقل من 10 أحرف."
             elif action == "remove_enrollment":
                 uid = request.form.get("user_id", type=int); cid = request.form.get("course_id", type=int)
                 if uid and cid:
-                    con.execute("DELETE FROM enrollments WHERE user_id=? AND course_id=?", (uid,cid)); message = "تم إلغاء الاشتراك."
+                    con.execute("DELETE FROM enrollments WHERE user_id=%s AND course_id=%s", (uid,cid)); message = "تم إلغاء الاشتراك."
 
     with connect() as con:
         courses = con.execute("SELECT * FROM courses ORDER BY id DESC").fetchall()
